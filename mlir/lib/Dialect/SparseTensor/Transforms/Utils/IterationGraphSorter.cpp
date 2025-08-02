@@ -24,28 +24,6 @@ using namespace mlir;
 using namespace mlir::sparse_tensor;
 
 namespace {
-
-// Command line option for loop ordering strategy
-static llvm::cl::opt<sparse_tensor::LoopOrderingStrategy> loopOrderingStrategy(
-    "sparse-loop-ordering",
-    llvm::cl::desc("Loop ordering strategy for sparse tensor compilation"),
-    llvm::cl::values(
-        clEnumValN(sparse_tensor::LoopOrderingStrategy::kDefault, "default",
-                   "Default: Prefer parallel loops to reduction loops"),
-        clEnumValN(sparse_tensor::LoopOrderingStrategy::kMemoryAware, "memory-aware",
-                   "Memory-aware: Optimize for cache locality and memory access patterns"),
-        clEnumValN(sparse_tensor::LoopOrderingStrategy::kDenseOuter, "dense-outer",
-                   "Dense-outer: Dense dimensions outer, sparse inner"),
-        clEnumValN(sparse_tensor::LoopOrderingStrategy::kSparseOuter, "sparse-outer",
-                   "Sparse-outer: Sparse dimensions outer, dense inner"),
-        clEnumValN(sparse_tensor::LoopOrderingStrategy::kSequentialFirst, "sequential-first",
-                   "Sequential-first: Sequential access patterns first"),
-        clEnumValN(sparse_tensor::LoopOrderingStrategy::kParallelFirst, "parallel-first",
-                   "Parallel-first: Parallel loops first, then by density"),
-        clEnumValN(sparse_tensor::LoopOrderingStrategy::kAdaptive, "adaptive",
-                   "Adaptive: Automatically selects optimal strategy")),
-    llvm::cl::init(sparse_tensor::LoopOrderingStrategy::kDefault));
-
 /// A helper class that visits an affine expression and tries to find
 /// an AffineDimExpr to which the corresponding iterator from a GenericOp
 /// matches the desired iterator type. If there is no matched iterator
@@ -337,9 +315,7 @@ IterationGraphSorter::IterationGraphSorter(
     SmallVector<Value> &&ins, SmallVector<AffineMap> &&loop2InsLvl, Value out,
     AffineMap loop2OutLvl, SmallVector<utils::IteratorType> &&iterTypes,
     LoopOrderingStrategy strategy)
-    : loopOrderingStrategy(strategy == LoopOrderingStrategy::kDefault ? 
-                           ::loopOrderingStrategy : strategy), 
-      ins(std::move(ins)),
+    : loopOrderingStrategy(strategy), ins(std::move(ins)),
       loop2InsLvl(std::move(loop2InsLvl)), out(out), loop2OutLvl(loop2OutLvl),
       iterTypes(std::move(iterTypes)) {
   // One map per tensor.

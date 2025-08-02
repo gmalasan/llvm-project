@@ -67,12 +67,13 @@ struct SparseReinterpretMap
   SparseReinterpretMap(const SparseReinterpretMap &pass) = default;
   SparseReinterpretMap(const SparseReinterpretMapOptions &options) {
     scope = options.scope;
+    loopOrderingStrategy = options.loopOrderingStrategy;
   }
 
   void runOnOperation() override {
     auto *ctx = &getContext();
     RewritePatternSet patterns(ctx);
-    populateSparseReinterpretMap(patterns, scope);
+    populateSparseReinterpretMap(patterns, scope, loopOrderingStrategy);
     (void)applyPatternsGreedily(getOperation(), std::move(patterns));
   }
 };
