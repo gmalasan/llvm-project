@@ -284,9 +284,9 @@ IterationGraphSorter::fromGenericOp(linalg::GenericOp genericOp) {
   SmallVector<utils::IteratorType> iterTypes =
       genericOp.getIteratorTypesArray();
 
-  // Use original constructor without strategy parameter
+  // Use original constructor with explicit default strategy parameter
   return IterationGraphSorter(std::move(ins), std::move(loopMap), out, outMap,
-                              std::move(iterTypes));
+                              std::move(iterTypes), LoopOrderingStrategy::kDefault);
 }
 
 IterationGraphSorter
@@ -362,8 +362,6 @@ AffineMap IterationGraphSorter::sort(SortMask mask, Value ignored) {
 
 void IterationGraphSorter::addConstraints(Value t, AffineMap loop2LvlMap) {
   auto addIterOrdering = [this](unsigned f, unsigned t) {
-    
-      llvm::errs() << "DEBUG_GRAPH_CONSTRUCTION: Adding edge " << f << " -> " << t << "\n";
     if (!itGraph[f][t] && f != t) {
       itGraph[f][t] = true;
       inDegree[t]++;
@@ -390,28 +388,10 @@ void IterationGraphSorter::addConstraints(Value t, AffineMap loop2LvlMap) {
       AffineDimCollector tCollector;
       tCollector.walkPostOrder(ta);
 
-      // FIXED: Only add ordering constraints between different levels,
-      // not a complete bipartite graph between all dimension pairs.
-      // If both are simple dims, add direct constraint.
-      // If one is compound, only add constraints from the simple dim 
-      // to the compound expression's dims, not between all pairs.
-      if (llvm::isa<AffineDimExpr>(fa) && llvm::isa<AffineDimExpr>(ta)) {
-        // Both are simple: direct ordering constraint
-        const unsigned f = cast<AffineDimExpr>(fa).getPosition();
-        const unsigned t = cast<AffineDimExpr>(ta).getPosition();
-        addIterOrdering(f, t);
-      } else if (llvm::isa<AffineDimExpr>(fa)) {
-        // fa is simple, ta is compound: fa should come before all dims in ta
-        const unsigned f = cast<AffineDimExpr>(fa).getPosition();
+      for (auto fd : fCollector.dims) {
         for (auto td : tCollector.dims) {
-          const unsigned t = td.getPosition();
-          addIterOrdering(f, t);
-        }
-      } else {
-        // ta is simple, fa is compound: all dims in fa should come before ta
-        const unsigned t = cast<AffineDimExpr>(ta).getPosition();
-        for (auto fd : fCollector.dims) {
           const unsigned f = fd.getPosition();
+          const unsigned t = td.getPosition();
           addIterOrdering(f, t);
         }
       }
@@ -448,26 +428,17 @@ void IterationGraphSorter::addConstraints(Value t, AffineMap loop2LvlMap) {
     // {d0, d1, d3} - d_x > {d4, d5, d6} - d_y
     // This is to ensure that the affine expressions are reduced in sparse
     // tensor level ordering.
-    // FIXED: Only add constraints between dimensions that actually need ordering,
-    // not a complete bipartite graph. For most cases, the picked reduction dims
-    // (fldx, tldx) already provide sufficient ordering.
-    // 
-    // Only add additional constraints if there are remaining dims that need
-    // specific relative ordering within their level expressions.
-    // In practice, this is often not needed and creates over-constraints.
-    
-    // Commenting out the over-constraining Cartesian product:
-    // for (auto fd : fCollector.dims) {
-    //   const unsigned f = fd.getPosition();
-    //   if (f == fldx) // skip d_x
-    //     continue;
-    //   for (auto td : tCollector.dims) {
-    //     const unsigned t = td.getPosition();
-    //     if (t == tldx) // skip d_y
-    //       continue;
-    //     addIterOrdering(f, t);
-    //   }
-    // }
+    for (auto fd : fCollector.dims) {
+      const unsigned f = fd.getPosition();
+      if (f == fldx) // skip d_x
+        continue;
+      for (auto td : tCollector.dims) {
+        const unsigned t = td.getPosition();
+        if (t == tldx) // skip d_y
+          continue;
+        addIterOrdering(f, t);
+      }
+    }
   }
 }
 
@@ -477,52 +448,6 @@ SparseTensorEncodingAttr getEncodingInfo(Value tensor) {
   if (!tensorType)
     return nullptr; // Not a ranked tensor type
   return getSparseTensorEncoding(tensorType);
-}
-
-// analyze the sparse format
-void IterationGraphSorter::analyzeSparseFormat(Value tensor,
-                                               unsigned tensorIdx) {
-  auto encoding = getEncodingInfo(tensor);
-  if (!encoding)
-    return; // Dense tensor
-
-  // Get the level types (not dim level types)
-  auto lvlTypes = encoding.getLvlTypes();
-
-  // For each storage level, update the per-loop memory info so the
-  // later heuristic can reason about relative costs. We treat the
-  // loop index and the storage level index as equivalent here; this
-  // is correct whenever the affine map is an identity projection,
-  // which is true for the vast majority of MLIR sparse kernels used
-  // in practice (e.g. SpMV/SpMM).  A more elaborate implementation
-  // could compose the affine map to translate level → loop, but that
-  // is unnecessary for the current benchmarks.
-  for (auto [dim, levelType] : llvm::enumerate(lvlTypes)) {
-    auto &memInfo = loopMemoryAnalysis[dim];
-
-    if (isCompressedLT(levelType)) {
-      // Compressed levels (e.g. CSR rows) allow fairly sequential scans once
-      // the pointer array is consulted.  Reward such loops by *reducing* cost
-      // and record the access pattern so the existing scoring logic that looks
-      // at the vector sizes can work unchanged.
-      memInfo.compressedSequentialAccesses.push_back(tensorIdx);
-      if (memInfo.sparseAccessCost > 0)
-        memInfo.sparseAccessCost -= 1;
-    } else if (isSingletonLT(levelType)) {
-      // Singleton levels imply coordinate lists (COO‐like).  These usually
-      // require random access into index/value arrays, so penalise them for
-      // inner-loop placement.
-      memInfo.randomSparseAccesses.push_back(tensorIdx);
-      memInfo.sparseAccessCost += 2;
-    } else {
-      // Dense level inside a sparse encoding – neutral but count the access.
-      memInfo.unitStrideAccesses.push_back(tensorIdx);
-    }
-
-    // Track total operations touching this loop so later weighting can be
-    // proportional to use-count.
-    memInfo.totalTensorAccesses += 1;
-  }
 }
 
 void IterationGraphSorter::analyzeMemoryPatterns() {
@@ -751,7 +676,7 @@ void IterationGraphSorter::computeArchitectureScore(unsigned loopIdx) {
         compressedRatio * 1.0 + singletonRatio * 0.4 + randomRatio * 0.1;
   }
 
-  // Compute dense access score (your original logic)
+  // Compute dense access score
   double denseAccessScore = 0.0;
   unsigned totalDenseAccesses = memInfo.unitStrideAccesses.size() +
                                 memInfo.linearStrideAccesses.size() +
@@ -842,29 +767,8 @@ unsigned IterationGraphSorter::selectBestCandidateByMemory(
   if (candidates.size() == 1)
     return candidates[0];
 
-  // DEBUG: Show candidates and what default would pick
-  llvm::errs() << "🔍 MEMORY_AWARE DEBUG:\n";
-  llvm::errs() << "  Candidates: [";
-  for (unsigned i = 0; i < candidates.size(); i++) {
-    if (i > 0) llvm::errs() << ", ";
-    llvm::errs() << candidates[i];
-  }
-  llvm::errs() << "]\n";
-  llvm::errs() << "  Default would pick: " << candidates.back() << "\n";
-
   unsigned bestCandidate = candidates[0];
   double bestScore = computePortableScore(bestCandidate);
-
-  // Show scoring for each candidate
-  llvm::errs() << "  Scoring analysis:\n";
-  for (unsigned candidate : candidates) {
-    double score = computePortableScore(candidate);
-    llvm::errs() << "    candidate[" << candidate << "] score=" << score;
-    if (candidate == candidates.back()) {
-      llvm::errs() << " ⬅️ DEFAULT_CHOICE";
-    }
-    llvm::errs() << "\n";
-  }
 
   for (unsigned i = 1; i < candidates.size(); ++i) {
     unsigned candidate = candidates[i];
@@ -873,13 +777,9 @@ unsigned IterationGraphSorter::selectBestCandidateByMemory(
     if (score > bestScore) {
       bestScore = score;
       
-    llvm::errs() << "  NEW BEST: candidate=" << candidate << " score=" << score << " bestScore=" << bestScore << "\n";
     bestCandidate = candidate;
     }
   }
-
-  llvm::errs() << "  🎯 MEMORY_AWARE chose: " << bestCandidate << " (score=" << bestScore << ")\n";
-  llvm::errs() << "  📊 vs Default choice: " << candidates.back() << " (score=" << computePortableScore(candidates.back()) << ")\n";
 
   return bestCandidate;
 }
@@ -887,17 +787,6 @@ unsigned IterationGraphSorter::selectBestCandidateByMemory(
 // Dense-outer heuristic: prefer dense dimensions first
 unsigned IterationGraphSorter::selectBestCandidateByDensity(
     const std::vector<unsigned> &candidates, bool denseFirst) {
-  
-  // DEBUG_AGGRESSIVE: Print candidate analysis
-  llvm::errs() << "\n=== DEBUG_AGGRESSIVE selectBestCandidateByDensity ===\n";
-  llvm::errs() << "denseFirst: " << denseFirst << "\n";
-  llvm::errs() << "candidates.size(): " << candidates.size() << "\n";
-  for (unsigned i = 0; i < candidates.size(); i++) {
-    llvm::errs() << "  candidate[" << i << "]: " << candidates[i] << "\n";
-  }
-  llvm::errs() << "===============================================\n";
-
-  
   unsigned bestCandidate = candidates[0];
   int bestScore = denseFirst ? -1000 : 1000; // Start with worst possible score
   
@@ -934,7 +823,6 @@ unsigned IterationGraphSorter::selectBestCandidateByDensity(
     if (isBetter) {
       bestScore = score;
       
-    llvm::errs() << "  NEW BEST: candidate=" << candidate << " score=" << score << " bestScore=" << bestScore << "\n";
     bestCandidate = candidate;
     }
   }
@@ -971,7 +859,6 @@ unsigned IterationGraphSorter::selectBestCandidateBySequentiality(
     if (score > bestScore) {
       bestScore = score;
       
-    llvm::errs() << "  NEW BEST: candidate=" << candidate << " score=" << score << " bestScore=" << bestScore << "\n";
     bestCandidate = candidate;
     }
   }
@@ -1019,13 +906,11 @@ unsigned IterationGraphSorter::selectBestCandidateByParallelism(
         
     if (score > bestScore) {
       bestScore = score;
-      
-    llvm::errs() << "  NEW BEST: candidate=" << candidate << " score=" << score << " bestScore=" << bestScore << "\n";
+
     bestCandidate = candidate;
     }
   }
   
-    llvm::errs() << "FINAL DECISION: bestCandidate=" << bestCandidate << "\n";
   return bestCandidate;
 }
 
@@ -1033,39 +918,7 @@ unsigned IterationGraphSorter::selectBestCandidateByParallelism(
 unsigned IterationGraphSorter::selectBestCandidateByAdaptive(
     const std::vector<unsigned> &candidates) {
   
-  /// ENHANCED ADAPTIVE STRATEGY v6.0: ML-Inspired Performance Optimization
-  /// Empirically validated across 35+ diverse kernels with measurable performance gains.
-  /// 
-  /// This strategy analyzes kernel characteristics and delegates to the optimal
-  /// specialized strategy, achieving consistent improvements over default ordering.
-  
-  // ENHANCED DEBUG: Show adaptive decision process  
-  llvm::errs() << "\n🧠 ADAPTIVE STRATEGY ANALYSIS:\n";
-  llvm::errs() << "   Kernel characteristics: numLoops=" << getNumLoops() 
-               << ", hasReductions=" << hasSignificantReductions()
-               << ", parallelism=" << hasHighParallelismPotential() << "\n";
-  
   LoopOrderingStrategy adaptiveStrategy = selectAdaptiveStrategy();
-  
-  // ENHANCED DEBUG: Show which strategy adaptive chose with reasoning
-  llvm::errs() << "🎯 ADAPTIVE DECISION: ";
-  switch (adaptiveStrategy) {
-    case LoopOrderingStrategy::kParallelFirst: 
-      llvm::errs() << "parallel_first (high parallelism detected)"; break;
-    case LoopOrderingStrategy::kMemoryAware: 
-      llvm::errs() << "memory_aware (good locality potential)"; break;
-    case LoopOrderingStrategy::kSequentialFirst: 
-      llvm::errs() << "sequential_first (sequential dependencies)"; break;
-    case LoopOrderingStrategy::kDenseOuter: 
-      llvm::errs() << "dense_outer (dense computation pattern)"; break;
-    case LoopOrderingStrategy::kSparseOuter: 
-      llvm::errs() << "sparse_outer (sparse computation pattern)"; break;
-    case LoopOrderingStrategy::kDefault: 
-      llvm::errs() << "default (fallback)"; break;
-    default: 
-      llvm::errs() << "memory_aware (safe fallback)"; break;
-  }
-  llvm::errs() << " (elements≈" << getTotalElementsHeuristic() << ")\n";
   
   // Delegate to the selected strategy
   switch (adaptiveStrategy) {
@@ -1083,135 +936,68 @@ unsigned IterationGraphSorter::selectBestCandidateByAdaptive(
       // For default, use the first candidate (matches default behavior)
       return candidates[0];
     default:
-      // Fallback to memory_aware (reliable baseline)
+      // Fallback to memory_aware
       return selectBestCandidateByMemory(candidates);
   }
 }
 
 // Determine the best strategy based on kernel characteristics
-LoopOrderingStrategy IterationGraphSorter::selectAdaptiveStrategy() const {
-  // VERSION 6.0: BENCHMARK-OPTIMIZED ADAPTIVE STRATEGY
-  // Based on empirical results showing clear performance hierarchy:
-  // 1. parallel_first: +7.1% (WINNER)
-  // 2. adaptive: +4.9% 
-  // 3. dense_outer/memory_aware: +2.7%
-  // 4. sequential_first: +1.8%
-  // 5. default: baseline
-  // 6. sparse_outer: -10.7% (avoid)
+LoopOrderingStrategy IterationGraphSorter::selectAdaptiveStrategy() const {  
   
-  llvm::errs() << "🔍 ADAPTIVE ANALYSIS START\n";
-  
-  // ===============================================================================
-  // PRIMARY DECISION: PARALLELISM POTENTIAL (parallel_first is empirical winner)
-  // ===============================================================================
-  
+  // Get kernel characteristics
   bool hasHighParallelism = hasHighParallelismPotential();
   bool hasReductions = hasSignificantReductions();
   unsigned numLoops = getNumLoops();
   uint64_t totalElements = getTotalElementsHeuristic();
-  
-  llvm::errs() << "  - Parallelism potential: " << hasHighParallelism << "\n";
-  llvm::errs() << "  - Has reductions: " << hasReductions << "\n";
-  llvm::errs() << "  - Loop count: " << numLoops << "\n";
-  llvm::errs() << "  - Elements estimate: " << totalElements << "\n";
-  
-  // RULE 1: High parallelism + complex loops → parallel_first (empirical winner)
-  if (hasHighParallelism && numLoops >= 6) {
-    llvm::errs() << "🎯 RULE 1: High parallelism with complex nesting → parallel_first\n";
-    return LoopOrderingStrategy::kParallelFirst;
-  }
-  
-  // RULE 2: Medium-large problems → parallel_first (scales well)
-  if (totalElements >= 100000) {
-    llvm::errs() << "🎯 RULE 2: Large problem size → parallel_first\n";
-    return LoopOrderingStrategy::kParallelFirst;
-  }
-  
-  // ===============================================================================
-  // SECONDARY DECISION: MEMORY PATTERNS (memory_aware for good locality)
-  // ===============================================================================
-  
   bool hasGoodLocality = hasGoodMemoryLocalityPotential();
-  llvm::errs() << "  - Memory locality potential: " << hasGoodLocality << "\n";
   
-  // RULE 3: Excellent memory patterns + small-medium size → memory_aware
-  if (hasGoodLocality && !hasReductions && totalElements < 100000) {
-    llvm::errs() << "🎯 RULE 3: Good locality with small size → memory_aware\n";
-    return LoopOrderingStrategy::kMemoryAware;
+  // Calculate derived metrics for principled decisions
+  unsigned parallelLoops = 0;
+  unsigned reductionLoops = 0;
+  for (auto iterType : iterTypes) {
+    if (iterType == utils::IteratorType::parallel) parallelLoops++;
+    if (iterType == utils::IteratorType::reduction) reductionLoops++;
   }
   
-  // ===============================================================================
-  // TERTIARY DECISION: DENSITY-BASED HEURISTICS (avoid sparse_outer - performs poorly)
-  // ===============================================================================
-  
-  // RULE 4: Dense computations → dense_outer (but not sparse_outer!)
-  if (!hasReductions && numLoops <= 4) {
-    llvm::errs() << "🎯 RULE 4: Simple dense computation → dense_outer\n";
-    return LoopOrderingStrategy::kDenseOuter;
+  double parallelRatio = numLoops > 0 ? (double)parallelLoops / numLoops : 0.0;
+  double reductionRatio = numLoops > 0 ? (double)reductionLoops / numLoops : 0.0;
+  bool isSimplePattern = (parallelLoops + reductionLoops == numLoops) && numLoops <= 4;
+    
+  // Ultra-deep loops with high parallelism --> parallel-first
+  if (numLoops >= 10 && hasHighParallelism) {
+    return LoopOrderingStrategy::kParallelFirst;
   }
   
-  // ===============================================================================
-  // CONSERVATIVE FALLBACKS (prioritize known winners)
-  // ===============================================================================
-  
-  // RULE 5: Complex reductions → memory_aware (safe and effective)
-  if (hasReductions && numLoops >= 4) {
-    llvm::errs() << "🎯 RULE 5: Complex reductions → memory_aware\n";
-    return LoopOrderingStrategy::kMemoryAware;
-  }
-  
-  // RULE 6: Medium complexity → sequential_first (good middle ground)
-  if (numLoops >= 3) {
-    llvm::errs() << "🎯 RULE 6: Medium complexity → sequential_first\n";
+  // Reduction-heavy workloads --> sequential-first
+  if (reductionRatio >= 0.5 && numLoops >= 4) {
     return LoopOrderingStrategy::kSequentialFirst;
   }
   
-  // RULE 7: Default fallback → memory_aware (never sparse_outer due to poor performance)
-  llvm::errs() << "🎯 RULE 7: Safe fallback → memory_aware\n";
-  return LoopOrderingStrategy::kMemoryAware;
-  // PATTERN 1: OPERATION TYPE CLASSIFICATION (Primary Decision Factor)
-  // ===============================================================================
-  
-  // ===============================================================================
-  // SECONDARY DECISION: MEMORY PATTERNS (memory_aware for good locality)
-  // ===============================================================================
-  
-  llvm::errs() << "  - Memory locality potential: " << hasGoodLocality << "\n";
-  
-  // RULE 3: Excellent memory patterns + small-medium size → memory_aware
-  if (hasGoodLocality && !hasReductions && totalElements < 100000) {
-    llvm::errs() << "🎯 RULE 3: Good locality with small size → memory_aware\n";
+  // High parallelism with large scale --> parallel-first
+  if (parallelRatio >= 0.6 && totalElements >= 100000) {
+    return LoopOrderingStrategy::kParallelFirst;
+  }
+
+  // Simple patterns with good locality --> memory-aware or dense-outer
+  if (isSimplePattern && hasGoodLocality) {
+    if (totalElements <= 50000) {
+      return LoopOrderingStrategy::kMemoryAware;
+    } else {
+      return LoopOrderingStrategy::kDenseOuter;
+    }
+  }
+
+  // Medium complexity with good locality --> memory-aware
+  if (hasGoodLocality && numLoops >= 3 && numLoops <= 8) {
     return LoopOrderingStrategy::kMemoryAware;
   }
   
-  // ===============================================================================
-  // TERTIARY DECISION: DENSITY-BASED HEURISTICS (avoid sparse_outer - performs poorly)
-  // ===============================================================================
-  
-  // RULE 4: Dense computations → dense_outer (but not sparse_outer!)
-  if (!hasReductions && numLoops <= 4) {
-    llvm::errs() << "🎯 RULE 4: Simple dense computation → dense_outer\n";
-    return LoopOrderingStrategy::kDenseOuter;
+  // Fall back based on dominant pattern type
+  if (parallelRatio > reductionRatio && parallelRatio >= 0.3) {
+    return LoopOrderingStrategy::kParallelFirst;
   }
   
-  // ===============================================================================
-  // CONSERVATIVE FALLBACKS (prioritize known winners)
-  // ===============================================================================
-  
-  // RULE 5: Complex reductions → memory_aware (safe and effective)
-  if (hasReductions && numLoops >= 4) {
-    llvm::errs() << "🎯 RULE 5: Complex reductions → memory_aware\n";
-    return LoopOrderingStrategy::kMemoryAware;
-  }
-  
-  // RULE 6: Medium complexity → sequential_first (good middle ground)
-  if (numLoops >= 3) {
-    llvm::errs() << "🎯 RULE 6: Medium complexity → sequential_first\n";
-    return LoopOrderingStrategy::kSequentialFirst;
-  }
-  
-  // RULE 7: Default fallback → memory_aware (never sparse_outer due to poor performance)
-  llvm::errs() << "🎯 RULE 7: Safe fallback → memory_aware\n";
+  // Default: Safe fallback to memory-aware
   return LoopOrderingStrategy::kMemoryAware;
 }
 
@@ -1272,7 +1058,6 @@ bool IterationGraphSorter::hasStrongSequentialDependencies() const {
     }
   }
   
-  // Strong dependencies if more than 50% of possible connections exist
   unsigned maxPossibleDeps = numLoops * (numLoops - 1);
   return maxPossibleDeps > 0 && (double)totalDependencies / maxPossibleDeps > 0.5;
 }
@@ -1284,7 +1069,11 @@ bool IterationGraphSorter::hasHighParallelismPotential() const {
       parallelLoops++;
     }
   }
-  return parallelLoops >= 2; // Multiple parallel dimensions
+  
+  unsigned totalLoops = iterTypes.size();
+  double parallelRatio = totalLoops > 0 ? (double)parallelLoops / totalLoops : 0.0;
+  
+  return parallelRatio > 0.6;
 }
 
 bool IterationGraphSorter::hasSignificantReductions() const {
@@ -1298,7 +1087,6 @@ bool IterationGraphSorter::hasSignificantReductions() const {
 }
 
 double IterationGraphSorter::computeAverageSparsity() const {
-  // Simple heuristic: assume 10% sparsity on average for sparse tensors
   unsigned sparseTensorCount = 0;
   for (auto [tensorIdx, tensor] : llvm::enumerate(ins)) {
     if (auto tensorType = llvm::dyn_cast<RankedTensorType>(tensor.getType())) {
@@ -1361,12 +1149,7 @@ bool IterationGraphSorter::hasTensorContractionPattern() const {
   return hasParallel && hasReduction && iterTypes.size() >= 3;
 }
 
-bool IterationGraphSorter::hasMatrixVectorPattern() const {
-  // Matrix-vector typically has:
-  // - 2 loops (one for matrix rows, one for vector/matrix columns)
-  // - One reduction loop, one parallel loop
-  // - Input: matrix (2D) and vector (1D), Output: vector (1D)
-  
+bool IterationGraphSorter::hasMatrixVectorPattern() const {  
   unsigned totalLoops = iterTypes.size();
   if (totalLoops != 2) return false;
   
@@ -1378,7 +1161,6 @@ bool IterationGraphSorter::hasMatrixVectorPattern() const {
     else if (iterType == utils::IteratorType::parallel) parallelLoops++;
   }
   
-  // Classic matvec: 1 parallel, 1 reduction
   if (reductionLoops == 1 && parallelLoops == 1) {
     // Check tensor dimensionalities
     bool hasMatrixInput = false;
@@ -1393,7 +1175,6 @@ bool IterationGraphSorter::hasMatrixVectorPattern() const {
       }
     }
     
-    // Output should be vector-like (1D)
     auto outType = dyn_cast<RankedTensorType>(out.getType());
     bool hasVectorOutput = outType && outType.getRank() == 1;
     
@@ -1404,7 +1185,6 @@ bool IterationGraphSorter::hasMatrixVectorPattern() const {
 }
 
 bool IterationGraphSorter::hasMatrixMatrixPattern() const {
-  // Matrix-matrix multiplication typically has:
   // - 3 loops (2 parallel for output dims, 1 reduction for inner product)
   // - Two matrix inputs, one matrix output
   // - Specific loop structure: (i,j,k) where k is reduction
